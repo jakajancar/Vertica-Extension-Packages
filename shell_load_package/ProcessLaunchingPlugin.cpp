@@ -12,7 +12,11 @@
 
 using namespace Vertica;
 
-ProcessLaunchingPlugin::ProcessLaunchingPlugin(std::string cmd, std::vector<std::string> env) : cmd(cmd), env(env) {}
+ProcessLaunchingPlugin::ProcessLaunchingPlugin(std::string cmd, std::vector<std::string> env) : cmd(cmd), env(env) {
+    error.size = 2048;
+    error.buf = (char *)malloc(error.size);
+    error.offset = 0;
+}
 
 #ifndef NO_SUDO
 #define ProcessLaunchingPluginArgv(...) {"/usr/bin/sudo", "-E", "-u", "nobody", "-n", "--", __VA_ARGS__, NULL}
@@ -54,6 +58,7 @@ StreamState ProcessLaunchingPlugin::pump(DataBuffer &input, InputState input_sta
     // Buffer states
     bool input_buffer_empty = input.offset == input.size;
     bool output_buffer_full = output.offset == output.size;
+    bool error_buffer_full  = error.offset == error.size;
     
     // If upstream is done, close our stdin handle
     // so that our wrapped process knows to stop.
@@ -66,10 +71,12 @@ StreamState ProcessLaunchingPlugin::pump(DataBuffer &input, InputState input_sta
     }
     
     // Check stderr first since we treat it as fatal
-    if (stderr_has_data) {
-        // Use stderr for actual errors
-        char errbuf[2048];
-        ssize_t bytes_read = read(child.stderr, errbuf, 2047);
+    if (stderr_has_data && !error_buffer_full) {
+        if (error.offset == 0) {
+            // First error output, log the time.
+            first_error_time = time(NULL);
+        }
+        ssize_t bytes_read = read(child.stderr, error.buf + error.offset, error.size - error.offset);
         if (bytes_read < 0) {
             int err = errno;
             if (err == EAGAIN || err == EWOULDBLOCK) {
@@ -78,8 +85,7 @@ StreamState ProcessLaunchingPlugin::pump(DataBuffer &input, InputState input_sta
                 vt_report_error(0, "Error while reading stderr of external process (%d): %s", err, strerror(err));
             }
         } else if (bytes_read > 0) {
-            errbuf[bytes_read] = '\0';
-            vt_report_error(0, "External process '%s' reported error: %s", cmd.c_str(), errbuf);
+            error.offset += bytes_read;
         } else if (bytes_read == 0) {
             // Child process closed it's stderr
             close(child.stderr);
@@ -118,10 +124,22 @@ StreamState ProcessLaunchingPlugin::pump(DataBuffer &input, InputState input_sta
     // Buffer states after reading and writing
     input_buffer_empty = input.offset == input.size;
     output_buffer_full = output.offset == output.size;
+    error_buffer_full  = error.offset == error.size;
     
     // Return value
-    if (child.stdin == -1 && child.stdout == -1 && child.stderr == -1) {
-        checkProcessStatus();
+    if (error.offset > 0) {
+        // Process has written to stderr => fail
+        if (time(NULL) < first_error_time + 2 && child.stderr != -1) {
+            // Give it at least 1 second, in case it did something like
+            // write('Error: ') and the meaningful message is yet to come.
+            return KEEP_GOING;
+        } else {
+            error.buf[min(error.offset, error.size-1)] = '\0';
+            vt_report_error(0, "External process '%s' reported error: %s", cmd.c_str(), error.buf);
+        }
+    } else if (child.stdin == -1 && child.stdout == -1 && child.stderr == -1) {
+        checkProcessStatus(child.pid);
+        child.pid = -1;
         return DONE;
     } else {
         if (input_state != END_OF_FILE && input_buffer_empty && child.stdin >= 0) {
@@ -136,16 +154,21 @@ StreamState ProcessLaunchingPlugin::pump(DataBuffer &input, InputState input_sta
 
 void ProcessLaunchingPlugin::destroyProcess() {
     pclose3(child);
-    waitpid(child.pid, NULL, 0);
+    if (child.pid != -1) {
+        // TODO: Kill child to avoid having to wait 1 hour if error was reported anyway.
+        //       (it's a little problematic, since sudo runs as root and we don't have perms)
+        waitpid(child.pid, NULL, 0);
+    }
 }
 
-void ProcessLaunchingPlugin::checkProcessStatus() {
+// Does a waitpid() and calls vt_report_error if process did not exit with 0.
+void ProcessLaunchingPlugin::checkProcessStatus(pid_t pid) {
     int status;
-    pid_t waitpid_ret = waitpid(child.pid, &status, 0);
+    pid_t waitpid_ret = waitpid(pid, &status, 0);
     if (waitpid_ret == -1) {
         int err = errno;
         vt_report_error(0, "Error retrieving the termination status of child (%d): %s", err, strerror(err));
-    } else if (waitpid_ret == child.pid) {
+    } else if (waitpid_ret == pid) {
         // Child terminated, check termination status
         if (WIFEXITED(status)) {
             if (WEXITSTATUS(status) == 0) {
@@ -159,6 +182,10 @@ void ProcessLaunchingPlugin::checkProcessStatus() {
             vt_report_error(0, "Process terminated with unexpected status - 0x%x\n", status);
         }
     } else {
-        vt_report_error(0, "Internal error: waitpid returned %d (child pid is %d)", (int)waitpid_ret, child.pid);
+        vt_report_error(0, "Internal error: waitpid returned %d (child pid is %d)", (int)waitpid_ret, pid);
     }
+}
+
+ProcessLaunchingPlugin::~ProcessLaunchingPlugin() {
+    free(error.buf);
 }
