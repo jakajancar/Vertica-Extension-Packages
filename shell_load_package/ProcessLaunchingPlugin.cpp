@@ -135,7 +135,7 @@ StreamState ProcessLaunchingPlugin::pump(DataBuffer &input, InputState input_sta
             return KEEP_GOING;
         } else {
             error.buf[min(error.offset, error.size-1)] = '\0';
-            vt_report_error(0, "External process '%s' reported error: %s", cmd.c_str(), error.buf);
+            vt_report_error(0, "External process reported error: %s", error.buf);
         }
     } else if (child.stdin == -1 && child.stdout == -1 && child.stderr == -1) {
         checkProcessStatus(child.pid);
